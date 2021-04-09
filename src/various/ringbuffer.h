@@ -75,6 +75,7 @@
 #include    <string.h>
 #include    <stdint.h>
 #include    <iostream>
+#include    <atomic>
 
 /*
  *  a simple ringbuffer, lockfree, however only for a
@@ -133,12 +134,12 @@ template <class elementtype>
 class RingBuffer
 {
     private:
-        uint32_t    bufferSize;
-        volatile    uint32_t    writeIndex;
-        volatile    uint32_t    readIndex;
-        uint32_t    bigMask;
-        uint32_t    smallMask;
-        std::vector<char> buffer;
+        uint32_t        const   bufferSize;                 // does not matter but makes clear it is not
+        volatile        std::atomic_uint32_t    writeIndex; // ensure barriers by...
+        volatile        std::atomic_uint32_t    readIndex;  // ... atomic variables
+        uint32_t        bigMask;
+        uint32_t        smallMask;
+        elementtype*    buffer;                             // switch back to simple array, memcpy to std::vector works but is dangerous
 
     protected:
         void onDroppedData(int32_t droppedElements) {
@@ -147,56 +148,55 @@ class RingBuffer
         }
 
     public:
-        RingBuffer(uint32_t elementCount) {
-            if (((elementCount - 1) & elementCount) != 0)
-                elementCount = 2 * 16384;   /* default  */
-
-            bufferSize  = elementCount;
-            buffer.resize(2 * bufferSize * sizeof (elementtype));
+        RingBuffer(uint32_t elementCount) : bufferSize((((elementCount - 1) & elementCount) != 0) ? elementCount : (2 * 16384)){
+            buffer = new elementtype[2 * bufferSize];
             writeIndex  = 0;
             readIndex   = 0;
-            smallMask   = (elementCount)- 1;
-            bigMask     = (elementCount * 2) - 1;
+            smallMask   = (bufferSize)- 1;
+            bigMask     = (bufferSize * 2) - 1;
         }
 
         /*
          *  functions for checking available data for reading and space
          *  for writing
          */
-        int32_t GetRingBufferReadAvailable (void) {
+        inline int32_t GetRingBufferReadAvailable (void) {
             return (writeIndex - readIndex) & bigMask;
         }
 
-        int32_t ReadSpace   (void){
+        inline int32_t ReadSpace   (void){
             return GetRingBufferReadAvailable ();
         }
 
-        int32_t GetRingBufferWriteAvailable (void) {
+        inline int32_t GetRingBufferWriteAvailable (void) {
             return  bufferSize - GetRingBufferReadAvailable ();
         }
 
-        int32_t WriteSpace  (void) {
+        inline int32_t WriteSpace  (void) {
             return GetRingBufferWriteAvailable ();
         }
 
-        void    FlushRingBuffer () {
+        inline void FlushRingBuffer () {
             writeIndex  = 0;
             readIndex   = 0;
         }
+
         /* ensure that previous writes are seen before we update the write index
-           (write after write)
-           */
-        int32_t AdvanceRingBufferWriteIndex (int32_t elementCount) {
-            PaUtil_WriteMemoryBarrier();
+         * (write after write)
+         *
+         * Barriers are ensured by atomic variables => implies fences
+         */
+        inline int32_t AdvanceRingBufferWriteIndex (int32_t elementCount) {
             return writeIndex = (writeIndex + elementCount) & bigMask;
         }
 
         /* ensure that previous reads (copies out of the ring buffer) are
          * always completed before updating (writing) the read index.
          * (write-after-read) => full barrier
+         * 
+         * Barriers are ensured by atomic variables => implies fences
          */
-        int32_t AdvanceRingBufferReadIndex (int32_t elementCount) {
-            PaUtil_FullMemoryBarrier();
+        inline int32_t AdvanceRingBufferReadIndex (int32_t elementCount) {
             return readIndex = (readIndex + elementCount) & bigMask;
         }
 
@@ -290,12 +290,12 @@ class RingBuffer
                     &data1, &size1,
                     &data2, &size2 );
             if (size2 > 0) {
-                memcpy (data1, data, size1 * sizeof(elementtype));
+                memcpy (data1, data, size1);
                 data = ((char *)data) + size1 * sizeof(elementtype);
-                memcpy (data2, data, size2 * sizeof(elementtype));
+                memcpy (data2, data, size2);
             }
             else
-                memcpy (data1, data, size1 * sizeof(elementtype));
+                memcpy (data1, data, size1);
 
             AdvanceRingBufferWriteIndex (numWritten );
             return numWritten;
@@ -310,12 +310,12 @@ class RingBuffer
                     &data1, &size1,
                     &data2, &size2 );
             if (size2 > 0) {
-                memcpy (data, data1, size1 * sizeof(elementtype));
+                memcpy (data, data1, size1);
                 data = ((char *)data) + size1 *  sizeof(elementtype);
-                memcpy (data, data2, size2 * sizeof(elementtype));
+                memcpy (data, data2, size2);
             }
             else
-                memcpy (data, data1, size1 * sizeof(elementtype));
+                memcpy (data, data1, size1);
 
             AdvanceRingBufferReadIndex (numRead );
             return numRead;
@@ -323,9 +323,10 @@ class RingBuffer
 
         int32_t skipDataInBuffer (int32_t n_values) {
             //  ensure that we have the correct read and write indices
-            PaUtil_FullMemoryBarrier ();
-            if (n_values > GetRingBufferReadAvailable ())
-                n_values = GetRingBufferReadAvailable ();
+            // PaUtil_FullMemoryBarrier (); ensured by atomic
+            int32_t available = GetRingBufferReadAvailable();
+            if (n_values > available)
+                n_values = available;
             AdvanceRingBufferReadIndex (n_values);
             return n_values;
         }
